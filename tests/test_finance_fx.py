@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from dq.framework import DQGateFailedError
 from spark_jobs.bronze.ingest_finance import (
     FX_RATES,
     INVOICES,
@@ -213,6 +214,45 @@ def test_silver_fx_weekend_batch_date_and_backfill_never_truncate(spark, fx_env)
     silver = _load(spark, lakehouse_root, "silver", "silver_fx_rates_daily")
     assert silver.count() == 84
     assert silver.filter("rate IS NULL").count() == 0
+    # ...and later days must keep their real observed rates (not stale forward-fills).
+    last_day = silver.filter(
+        "rate_date = DATE '2026-01-14' AND currency_from = 'EUR' AND currency_to = 'USD'"
+    ).first()
+    assert last_day["rate"] == _rate(date(2026, 1, 14), 0)
+    assert last_day["is_forward_filled"] is False
+    assert silver.filter("is_forward_filled").count() == 4 * 6  # only the 4 weekend days
+
+
+def test_bronze_fx_missing_weekday_file_fails(spark, fx_env) -> None:
+    landing_root, lakehouse_root = fx_env
+    # 2026-01-15 is a Thursday and has no FX file -> must not be silently skipped.
+    with pytest.raises(FileNotFoundError, match="fx_rates"):
+        ingest_daily_dataset(spark, FX_RATES, "2026-01-15", str(landing_root), str(lakehouse_root))
+
+
+def test_silver_fx_missing_pair_fails_hard_and_keeps_previous_table(spark, fx_env) -> None:
+    landing_root, lakehouse_root = fx_env
+    transform_fx_rates.run(spark, "2026-01-14", str(lakehouse_root), run_id="good")
+
+    # Re-deliver every weekday without the CZK->USD pair.
+    for day in DAYS:
+        if day not in WEEKEND_DAYS:
+            rows = [r for r in _fx_rows(day) if (r["currency_from"], r["currency_to"]) != PAIRS[5]]
+            _write_fx_file(landing_root, day, rows)
+    _ingest_fx_days(spark, landing_root, lakehouse_root, DAYS)
+
+    with pytest.raises(DQGateFailedError, match="not_null_rate"):
+        transform_fx_rates.run(spark, "2026-01-14", str(lakehouse_root), run_id="bad")
+
+    # Checks run before writing -> the previous good table is untouched.
+    silver = _load(spark, lakehouse_root, "silver", "silver_fx_rates_daily")
+    assert silver.count() == 84
+    assert silver.filter("rate IS NULL").count() == 0
+    audit = _load(spark, lakehouse_root, "dq", "dq_audit_results").filter(
+        "table_name = 'silver_fx_rates_daily' AND check_name = 'not_null_rate'"
+    )
+    failed = audit.first()
+    assert (failed["run_id"], failed["status"], failed["failed_count"]) == ("bad", "FAIL", 14)
 
 
 def test_silver_fx_quarantines_bad_rows_and_fills_the_gap(spark, fx_env) -> None:

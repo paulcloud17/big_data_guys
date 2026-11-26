@@ -12,15 +12,21 @@ Why LOCF (Last Observation Carried Forward)?
     non-NULL rate -> Saturday and Sunday inherit Friday's rate.
 
 Design decisions:
-    - Full recompute on every run (spine from first FX date to the furthest of
-      `batch_date` and the current Silver end date). The table is tiny (~6 rows/day), so a
-      full rebuild is cheap, idempotent (same input -> same output) and backfill-safe
-      (running an older `batch_date` never truncates later days, and a late-arriving
-      Friday file automatically re-fills the following weekend).
+    - Full recompute on every run from ALL Bronze FX rows (spine from the first FX date to
+      the furthest of `batch_date` and the current Silver end date). The table is tiny
+      (~6 rows/day), so a full rebuild is cheap, idempotent (same input -> same output) and
+      backfill-safe: re-running an older `batch_date` neither truncates later days nor
+      replaces their observed rates, and a late-arriving Friday file re-fills its weekend.
+    - The spine always contains the fixed set of 6 pairs (all ordered pairs of EUR/USD/CZK).
+      A pair with no valid observation therefore shows up as NULL rates and fails the hard
+      `not_null_rate` check instead of silently disappearing.
+    - DQ checks run BEFORE writing: if a hard check fails, the previous Silver table stays
+      untouched (only the audit rows are written).
     - Invalid raw FX rows (NULL/<=0 rate, unknown currency, unparseable date) go to
       `silver_quarantine/fx_rates` with `dq_reasons`; the gap they leave is forward-filled.
     - Duplicate raw rows for the same (rate_date, pair): keep the latest `_batch_date`,
-      then latest `_ingested_at` (deterministic tie-breaker).
+      then latest `_ingested_at`, then the first row in the file (`_source_row_id`), then the
+      lowest rate -> fully deterministic.
     - Extra columns for traceability: `is_forward_filled`, `source_rate_date`.
 
 Sanity check (Days 1-14, 2026-01-01..2026-01-14): 14 days x 6 pairs = 84 rows, 0 NULL rates.
@@ -49,6 +55,7 @@ from spark_jobs.common.spark_session import (
 )
 
 VALID_CURRENCIES = ("EUR", "USD", "CZK")
+EXPECTED_PAIRS = tuple((a, b) for a in VALID_CURRENCIES for b in VALID_CURRENCIES if a != b)
 PAIR_COLS = ["currency_from", "currency_to"]
 SILVER_TABLE = "silver_fx_rates_daily"
 
@@ -117,8 +124,8 @@ def build_fx_rates_daily(valid_rates: DataFrame, end_date: date) -> DataFrame:
             "rate_date"
         )
     )
-    # 2) Every day x every currency pair (small x small cross join -> safe).
-    pairs = valid_rates.select(*PAIR_COLS).distinct()
+    # 2) Every day x every expected currency pair (small x small cross join -> safe).
+    pairs = spark.createDataFrame(list(EXPECTED_PAIRS), PAIR_COLS)
     grid = spine.crossJoin(pairs)
 
     # 3) Attach observed rates; weekends/holidays stay NULL for now.
@@ -142,13 +149,12 @@ def build_fx_rates_daily(valid_rates: DataFrame, end_date: date) -> DataFrame:
 
 
 def _completeness_check(fx_daily: DataFrame, run_id: str, batch_date: str) -> DQCheckResult:
-    """ERROR check: exactly one row per (rate_date, pair) over the whole spine."""
+    """ERROR check: exactly one row per (rate_date, expected pair) over the whole spine."""
     stats = fx_daily.agg(
         F.count(F.lit(1)).alias("total"),
         F.countDistinct("rate_date").alias("days"),
-        F.countDistinct(*PAIR_COLS).alias("pairs"),
     ).first()
-    expected = stats["days"] * stats["pairs"]
+    expected = stats["days"] * len(EXPECTED_PAIRS)
     distinct_keys = fx_daily.select("rate_date", *PAIR_COLS).distinct().count()
     failed = abs(stats["total"] - expected) + (stats["total"] - distinct_keys)
     return DQCheckResult(
@@ -180,18 +186,18 @@ def run(
     quarantine_path = join_path(resolved_lakehouse, "silver_quarantine", "fx_rates")
     audit_path = join_path(resolved_lakehouse, "dq", "dq_audit_results")
 
-    # Only Bronze data that was available "as of" this batch is used.
-    bronze_df = (
-        spark.read.format("delta")
-        .load(bronze_path)
-        .filter(F.col("_batch_date") <= F.to_date(F.lit(batch_date)))
-    )
+    # Full rebuild from ALL Bronze rows (not only <= batch_date): a backfill of an older day
+    # must not replace later observed rates with stale forward-filled values.
+    bronze_df = spark.read.format("delta").load(bronze_path)
     evaluated = _evaluate_bronze(bronze_df)
 
     quarantine_df = evaluated.filter(F.size("dq_reasons") > 0).drop("rate_date_parsed")
 
     dedup_window = Window.partitionBy("rate_date", *PAIR_COLS).orderBy(
-        F.col("_batch_date").desc(), F.col("_ingested_at").desc()
+        F.col("_batch_date").desc(),
+        F.col("_ingested_at").desc(),
+        F.col("_source_row_id").asc(),
+        F.col("rate").asc(),
     )
     valid_rates = (
         evaluated.filter(F.size("dq_reasons") == 0)
@@ -201,6 +207,7 @@ def run(
             "rate",
             "_batch_date",
             "_ingested_at",
+            "_source_row_id",
         )
         .withColumn("_rn", F.row_number().over(dedup_window))
         .filter(F.col("_rn") == 1)
@@ -213,22 +220,6 @@ def run(
     )
     # Compute once, so the write and the DQ checks below see exactly the same rows.
     fx_daily = fx_daily.localCheckpoint(eager=True)
-
-    # Full rebuild -> idempotent overwrite of the whole (small) table.
-    (
-        fx_daily.write.format("delta")
-        .mode("overwrite")
-        .option("overwriteSchema", "true")
-        .save(silver_path)
-    )
-    # Quarantine is also derived from all Bronze rows up to batch_date -> full overwrite.
-    (
-        quarantine_df.write.format("delta")
-        .mode("overwrite")
-        .option("overwriteSchema", "true")
-        .partitionBy("_batch_date")
-        .save(quarantine_path)
-    )
 
     dq_results = [
         check_not_null(
@@ -243,8 +234,23 @@ def run(
         _completeness_check(fx_daily, resolved_run_id, batch_date),
     ]
     write_audit_results(spark, dq_results, audit_path)
-    enforce_dq_gate(dq_results)
+    enforce_dq_gate(dq_results)  # raises BEFORE anything is overwritten
 
+    # Full rebuild -> idempotent overwrite of the whole (small) table.
+    (
+        fx_daily.write.format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .save(silver_path)
+    )
+    # Quarantine is also derived from all Bronze rows -> full overwrite.
+    (
+        quarantine_df.write.format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .partitionBy("_batch_date")
+        .save(quarantine_path)
+    )
     return fx_daily, quarantine_df
 
 

@@ -5,19 +5,24 @@ Pattern (same for all three datasets):
   `<landing_root>/<dataset>/date=<batch_date>/part-000.<ext>` with an explicit schema.
 - Keep raw values unchanged (e.g. invoice `issued_at` / `paid_at` stay raw strings,
   `expense_date` stays a raw string; parsing happens in Silver).
-- Append technical metadata `_batch_date`, `_ingested_at`, `_source_file`.
+- Append technical metadata `_batch_date`, `_ingested_at`, `_source_file`, plus
+  `_source_row_id` (`monotonically_increasing_id`: a small daily file is read as a single
+  Spark partition, so the id increases in file order) -> enables a deterministic
+  "first occurrence in the file wins" dedup tie-breaker in Silver.
 - Write to `bronze/<dataset>` partitioned by `_batch_date`, atomically replacing only that
   `_batch_date` (Delta `replaceWhere`) -> re-running a day never duplicates rows.
 
-`fx_rates` is delivered on weekdays only. A missing fx_rates file is expected on
-Saturdays/Sundays and is skipped without failing; Silver forward-fills those days.
-Missing `invoices` / `expenses` files are a real error and raise `FileNotFoundError`.
+`fx_rates` is delivered on weekdays only. A missing fx_rates file on a Saturday/Sunday is
+expected and skipped (Silver forward-fills those days). A missing file on a weekday - for
+any dataset - is a real error and raises `FileNotFoundError` (the real 200-day dataset has
+exactly one FX file per weekday, i.e. no holiday gaps).
 """
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from datetime import date
 
 from delta.tables import DeltaTable
 from pyspark.sql import DataFrame, SparkSession
@@ -72,7 +77,7 @@ class DailyDataset:
     file_name: str
     schema: StructType
     reader: str  # "json_array" | "jsonl" | "csv"
-    optional: bool = False  # True -> missing file is expected (e.g. weekend fx_rates)
+    weekend_gaps: bool = False  # True -> no file on Saturday/Sunday is expected (fx_rates)
 
 
 FX_RATES = DailyDataset("fx_rates", "part-000.json", FX_RATES_RAW_SCHEMA, "json_array", True)
@@ -113,6 +118,7 @@ def write_daily_partition(df: DataFrame, target_path: str, batch_date: str) -> N
         (
             writer.mode("overwrite")
             .option("replaceWhere", f"_batch_date = DATE '{batch_date}'")
+            .option("mergeSchema", "true")  # allow additive schema evolution
             .save(target_path)
         )
     else:
@@ -126,7 +132,12 @@ def ingest_daily_dataset(
     landing_root: str | None = None,
     lakehouse_root: str | None = None,
 ) -> DataFrame | None:
-    """Ingest one dataset for one `batch_date`. Returns None if an optional file is absent."""
+    """Ingest one dataset for one `batch_date`.
+
+    Returns None only for an expected gap (weekend fx_rates). A missing file on any other
+    day raises `FileNotFoundError`, so a lost weekday FX file can never be silently
+    forward-filled with a stale rate.
+    """
     resolved_landing = get_landing_root(landing_root)
     resolved_lakehouse = get_lakehouse_root(lakehouse_root)
 
@@ -134,10 +145,8 @@ def ingest_daily_dataset(
     target_path = join_path(resolved_lakehouse, "bronze", dataset.name)
 
     if not _path_exists(spark, source_path):
-        if dataset.optional:
-            print(
-                f"[bronze] {dataset.name}: no file for {batch_date} (expected on weekends) - skip"
-            )
+        if dataset.weekend_gaps and date.fromisoformat(batch_date).weekday() >= 5:
+            print(f"[bronze] {dataset.name}: no file for weekend day {batch_date} - skip")
             return None
         raise FileNotFoundError(f"Missing mandatory landing file: {source_path}")
 
@@ -146,6 +155,7 @@ def ingest_daily_dataset(
         .withColumn("_batch_date", F.to_date(F.lit(batch_date)))
         .withColumn("_ingested_at", F.current_timestamp())
         .withColumn("_source_file", F.input_file_name())
+        .withColumn("_source_row_id", F.monotonically_increasing_id())
     )
     write_daily_partition(bronze_df, target_path, batch_date)
     return bronze_df
