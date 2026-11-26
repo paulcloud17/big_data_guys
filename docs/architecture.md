@@ -47,12 +47,23 @@ flowchart LR
 4. Exact point-in-time join predicate used in `gold_project_profitability` when joining `silver_timesheets` on `work_date`.
 -->
 
-- **Interval Convention:** <!-- TODO: Closed or Half-open -->
-- **Open-End Sentinel:** <!-- TODO: e.g. 9999-12-31 or NULL -->
+- **Interval Convention:** Half-open `[valid_from, valid_to)` — `valid_from` is included (`work_date >= valid_from`) and `valid_to` is excluded (`work_date < valid_to`).
+- **Open-End Sentinel:** `NULL` — current (`is_current = true`) rows use `valid_to = NULL` to represent an open-ended validity interval.
 - **Point-in-Time Join Condition:**
   ```sql
-  -- TODO: Paste your exact SQL / PySpark join predicate between silver_timesheets and silver_employees_scd2
+  ts.emp_id = emp.emp_id AND ts.work_date >= emp.valid_from AND (emp.valid_to IS NULL OR ts.work_date < emp.valid_to)
   ```
+
+#### Example (`EMP_0496` rate change, as of January 3, 2026)
+
+As of January 3, 2026, `EMP_0496`'s `hourly_rate_eur` changed from `48.79` (observed in the `2026-01-01` and `2026-01-02` snapshots) to `54.17` starting on `2026-01-03`:
+
+| `emp_id` | `hourly_rate_eur` | `valid_from` (inclusive) | `valid_to` (exclusive) | `is_current` |
+| :--- | ---: | :---: | :---: | :---: |
+| `EMP_0496` | `48.79` | `2026-01-01` | `2026-01-03` | `false` |
+| `EMP_0496` | `54.17` | `2026-01-03` | `NULL` | `true` |
+
+Under `[valid_from, valid_to)`, a timesheet on `2026-01-02` matches the first record (`48.79`), while a timesheet on `2026-01-03` matches the current record (`54.17`, with `valid_to = NULL`) with no overlap.
 
 ---
 
