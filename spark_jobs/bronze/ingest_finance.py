@@ -5,7 +5,9 @@ Pattern (same for all three datasets):
   `<landing_root>/<dataset>/date=<batch_date>/part-000.<ext>` with an explicit schema.
 - Keep raw values unchanged (e.g. invoice `issued_at` / `paid_at` stay raw strings,
   `expense_date` stays a raw string; parsing happens in Silver).
-- Append technical metadata `_batch_date`, `_ingested_at`, `_source_file`.
+- Append technical metadata `_batch_date`, `_ingested_at`, `_source_file`, plus
+  `_source_row_id` (increasing in file order; one small daily file = one Spark partition)
+  so Silver can apply a deterministic "keep the first occurrence" dedup rule.
 - Write to `bronze/<dataset>` partitioned by `_batch_date`, atomically replacing only that
   `_batch_date` (Delta `replaceWhere`) -> re-running a day never duplicates rows.
 
@@ -19,11 +21,11 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 
-from delta.tables import DeltaTable
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import DoubleType, StringType, StructField, StructType
 
+from spark_jobs.common.delta_io import replace_batch_partition
 from spark_jobs.common.spark_session import (
     get_lakehouse_root,
     get_landing_root,
@@ -100,25 +102,6 @@ def _read_raw(spark: SparkSession, dataset: DailyDataset, source_path: str) -> D
     raise ValueError(f"Unknown reader '{dataset.reader}' for dataset {dataset.name}")
 
 
-def write_daily_partition(df: DataFrame, target_path: str, batch_date: str) -> None:
-    """Atomically replace one `_batch_date` partition of a Bronze Delta table.
-
-    First run creates the table; later runs use `replaceWhere`, which deletes the old rows
-    of that day and inserts the new ones in a single Delta commit (so a crash can never
-    leave the day half-deleted, and re-runs never duplicate).
-    """
-    spark = df.sparkSession
-    writer = df.write.format("delta").partitionBy("_batch_date")
-    if DeltaTable.isDeltaTable(spark, target_path):
-        (
-            writer.mode("overwrite")
-            .option("replaceWhere", f"_batch_date = DATE '{batch_date}'")
-            .save(target_path)
-        )
-    else:
-        writer.mode("overwrite").save(target_path)
-
-
 def ingest_daily_dataset(
     spark: SparkSession,
     dataset: DailyDataset,
@@ -146,8 +129,9 @@ def ingest_daily_dataset(
         .withColumn("_batch_date", F.to_date(F.lit(batch_date)))
         .withColumn("_ingested_at", F.current_timestamp())
         .withColumn("_source_file", F.input_file_name())
+        .withColumn("_source_row_id", F.monotonically_increasing_id())
     )
-    write_daily_partition(bronze_df, target_path, batch_date)
+    replace_batch_partition(bronze_df, target_path, batch_date)
     return bronze_df
 
 
