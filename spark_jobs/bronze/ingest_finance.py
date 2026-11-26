@@ -1,27 +1,164 @@
-"""Bronze ingestion skeleton for Finance domain (`fx_rates`, `invoices`, `expenses`).
+"""Bronze ingestion for the Finance domain (`fx_rates`, `invoices`, `expenses`).
 
-TODO (Student Deliverable):
-1. Read daily Hive-partitioned files for `batch_date`:
-   - `<landing_root>/fx_rates/date=<batch_date>/part-000.json`
-     IMPORTANT: `fx_rates` is delivered on **weekdays only** (no Saturday/Sunday
-     files). Handle missing weekend `fx_rates` partitions gracefully without failing!
-   - `<landing_root>/invoices/date=<batch_date>/part-000.jsonl`
-     Keep raw `issued_at` and `paid_at` strings (ISO & `DD.MM.YYYY`) unchanged in Bronze.
-   - `<landing_root>/expenses/date=<batch_date>/part-000.csv`
-2. Append `_batch_date`, `_ingested_at`, `_source_file`.
-3. Write idempotently partitioned by `_batch_date` to `bronze/fx_rates`,
-   `bronze/invoices`, and `bronze/expenses`.
+Pattern (same for all three datasets):
+- Read exactly one daily Hive-style partition
+  `<landing_root>/<dataset>/date=<batch_date>/part-000.<ext>` with an explicit schema.
+- Keep raw values unchanged (e.g. invoice `issued_at` / `paid_at` stay raw strings,
+  `expense_date` stays a raw string; parsing happens in Silver).
+- Append technical metadata `_batch_date`, `_ingested_at`, `_source_file`, plus
+  `_source_row_id` (`monotonically_increasing_id`: a small daily file is read as a single
+  Spark partition, so the id increases in file order) -> enables a deterministic
+  "first occurrence in the file wins" dedup tie-breaker in Silver.
+- Write to `bronze/<dataset>` partitioned by `_batch_date`, atomically replacing only that
+  `_batch_date` (Delta `replaceWhere`) -> re-running a day never duplicates rows.
 
-Reference: `docs/STUDENT_ASSIGNMENT.md` (Sections 3.4, 4.2.A) and `docs/SANITY_CHECKS.md`.
+`fx_rates` is delivered on weekdays only. A missing fx_rates file on a Saturday/Sunday is
+expected and skipped (Silver forward-fills those days). A missing file on a weekday - for
+any dataset - is a real error and raises `FileNotFoundError` (the real 200-day dataset has
+exactly one FX file per weekday, i.e. no holiday gaps).
 """
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
+from datetime import date
 
-from pyspark.sql import SparkSession
+from delta.tables import DeltaTable
+from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.types import DoubleType, StringType, StructField, StructType
 
-from spark_jobs.common.spark_session import get_spark_session
+from spark_jobs.common.spark_session import (
+    get_lakehouse_root,
+    get_landing_root,
+    get_spark_session,
+    join_path,
+)
+
+FX_RATES_RAW_SCHEMA = StructType(
+    [
+        StructField("rate_date", StringType(), nullable=True),
+        StructField("currency_from", StringType(), nullable=True),
+        StructField("currency_to", StringType(), nullable=True),
+        StructField("rate", DoubleType(), nullable=True),
+    ]
+)
+
+INVOICES_RAW_SCHEMA = StructType(
+    [
+        StructField("inv_id", StringType(), nullable=True),
+        StructField("client_id", StringType(), nullable=True),
+        StructField("project_id", StringType(), nullable=True),
+        StructField("amount", DoubleType(), nullable=True),
+        StructField("currency", StringType(), nullable=True),
+        StructField("issued_at", StringType(), nullable=True),  # raw: ISO or DD.MM.YYYY
+        StructField("paid_at", StringType(), nullable=True),  # raw, NULL = unpaid
+    ]
+)
+
+EXPENSES_RAW_SCHEMA = StructType(
+    [
+        StructField("exp_id", StringType(), nullable=True),
+        StructField("department", StringType(), nullable=True),
+        StructField("category", StringType(), nullable=True),
+        StructField("amount", DoubleType(), nullable=True),
+        StructField("currency", StringType(), nullable=True),
+        StructField("expense_date", StringType(), nullable=True),  # raw, parsed in Silver
+    ]
+)
+
+
+@dataclass(frozen=True)
+class DailyDataset:
+    """Describes one daily-partitioned landing dataset."""
+
+    name: str
+    file_name: str
+    schema: StructType
+    reader: str  # "json_array" | "jsonl" | "csv"
+    weekend_gaps: bool = False  # True -> no file on Saturday/Sunday is expected (fx_rates)
+
+
+FX_RATES = DailyDataset("fx_rates", "part-000.json", FX_RATES_RAW_SCHEMA, "json_array", True)
+INVOICES = DailyDataset("invoices", "part-000.jsonl", INVOICES_RAW_SCHEMA, "jsonl")
+EXPENSES = DailyDataset("expenses", "part-000.csv", EXPENSES_RAW_SCHEMA, "csv")
+FINANCE_DATASETS = (FX_RATES, INVOICES, EXPENSES)
+
+
+def _path_exists(spark: SparkSession, path: str) -> bool:
+    """Check existence via Hadoop FS so it works for local paths and s3a:// alike."""
+    jvm_path = spark._jvm.org.apache.hadoop.fs.Path(path)  # noqa: SLF001
+    fs = jvm_path.getFileSystem(spark._jsc.hadoopConfiguration())  # noqa: SLF001
+    return fs.exists(jvm_path)
+
+
+def _read_raw(spark: SparkSession, dataset: DailyDataset, source_path: str) -> DataFrame:
+    reader = spark.read.schema(dataset.schema)
+    if dataset.reader == "json_array":
+        # One JSON document holding an array of objects -> one row per array element.
+        return reader.option("multiLine", "true").json(source_path)
+    if dataset.reader == "jsonl":
+        return reader.json(source_path)
+    if dataset.reader == "csv":
+        return reader.option("header", "true").csv(source_path)
+    raise ValueError(f"Unknown reader '{dataset.reader}' for dataset {dataset.name}")
+
+
+def write_daily_partition(df: DataFrame, target_path: str, batch_date: str) -> None:
+    """Atomically replace one `_batch_date` partition of a Bronze Delta table.
+
+    First run creates the table; later runs use `replaceWhere`, which deletes the old rows
+    of that day and inserts the new ones in a single Delta commit (so a crash can never
+    leave the day half-deleted, and re-runs never duplicate).
+    """
+    spark = df.sparkSession
+    writer = df.write.format("delta").partitionBy("_batch_date")
+    if DeltaTable.isDeltaTable(spark, target_path):
+        (
+            writer.mode("overwrite")
+            .option("replaceWhere", f"_batch_date = DATE '{batch_date}'")
+            .option("mergeSchema", "true")  # allow additive schema evolution
+            .save(target_path)
+        )
+    else:
+        writer.mode("overwrite").save(target_path)
+
+
+def ingest_daily_dataset(
+    spark: SparkSession,
+    dataset: DailyDataset,
+    batch_date: str,
+    landing_root: str | None = None,
+    lakehouse_root: str | None = None,
+) -> DataFrame | None:
+    """Ingest one dataset for one `batch_date`.
+
+    Returns None only for an expected gap (weekend fx_rates). A missing file on any other
+    day raises `FileNotFoundError`, so a lost weekday FX file can never be silently
+    forward-filled with a stale rate.
+    """
+    resolved_landing = get_landing_root(landing_root)
+    resolved_lakehouse = get_lakehouse_root(lakehouse_root)
+
+    source_path = join_path(resolved_landing, dataset.name, f"date={batch_date}", dataset.file_name)
+    target_path = join_path(resolved_lakehouse, "bronze", dataset.name)
+
+    if not _path_exists(spark, source_path):
+        if dataset.weekend_gaps and date.fromisoformat(batch_date).weekday() >= 5:
+            print(f"[bronze] {dataset.name}: no file for weekend day {batch_date} - skip")
+            return None
+        raise FileNotFoundError(f"Missing mandatory landing file: {source_path}")
+
+    bronze_df = (
+        _read_raw(spark, dataset, source_path)
+        .withColumn("_batch_date", F.to_date(F.lit(batch_date)))
+        .withColumn("_ingested_at", F.current_timestamp())
+        .withColumn("_source_file", F.input_file_name())
+        .withColumn("_source_row_id", F.monotonically_increasing_id())
+    )
+    write_daily_partition(bronze_df, target_path, batch_date)
+    return bronze_df
 
 
 def run(
@@ -29,9 +166,13 @@ def run(
     batch_date: str,
     landing_root: str | None = None,
     lakehouse_root: str | None = None,
-) -> None:
-    """TODO: Implement Bronze ingestion for `fx_rates`, `invoices`, and `expenses`."""
-    raise NotImplementedError("TODO: Implement Bronze Finance ingestion.")
+) -> dict[str, int]:
+    """Ingest `fx_rates`, `invoices` and `expenses` for `batch_date`; return row counts."""
+    counts: dict[str, int] = {}
+    for dataset in FINANCE_DATASETS:
+        df = ingest_daily_dataset(spark, dataset, batch_date, landing_root, lakehouse_root)
+        counts[dataset.name] = 0 if df is None else df.count()
+    return counts
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,6 +187,7 @@ if __name__ == "__main__":
     args = parse_args()
     spark = get_spark_session("bronze-ingest-finance")
     try:
-        run(spark, args.batch_date, args.landing_root, args.lakehouse_root)
+        row_counts = run(spark, args.batch_date, args.landing_root, args.lakehouse_root)
+        print(f"Bronze finance ingested for batch_date={args.batch_date}: {row_counts}")
     finally:
         spark.stop()
