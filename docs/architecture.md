@@ -62,7 +62,7 @@ flowchart LR
 
 | Dataset | Business Key | Tie-Breaker Ordering Rule | Rationale |
 | :--- | :--- | :--- | :--- |
-| `timesheets` | `ts_id` | <!-- TODO --> | <!-- TODO --> |
+| `timesheets` | `ts_id` | `Window.partitionBy("ts_id").orderBy(valid_hours_rank ASC, has_project_rank ASC, hours ASC NULLS LAST, emp_id ASC NULLS LAST, project_id ASC NULLS LAST, work_date ASC NULLS LAST, _ingested_at DESC NULLS LAST, _source_file ASC NULLS LAST)` where `valid_hours_rank = 0` for `0 < hours <= 24` else `1`, and `has_project_rank = 0` for `project_id IS NOT NULL` else `1`. | Prefers a valid `(0, 24]` entry with a project over a corrupted near-duplicate, then picks the lowest valid positive `hours` for conservative labor-cost attribution; remaining columns provide a total deterministic order across Spark partitions and re-runs. |
 | `expenses` | `exp_id` | <!-- TODO --> | <!-- TODO --> |
 | `employee_surveys` | `survey_id` | <!-- TODO --> | <!-- TODO --> |
 
